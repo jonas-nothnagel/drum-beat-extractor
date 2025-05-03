@@ -201,7 +201,14 @@ class DrumBeatExtractor:
         """The actual audio analysis logic to run in a thread"""
         try:
             # Load audio
-            self.y, self.sr = librosa.load(self.audio_file)
+            # Load as mono for HPSS and feature extraction
+            self.y, self.sr = librosa.load(self.audio_file, sr=None, mono=True)
+
+            # --- Perform HPSS --- # 
+            self.root.after(0, self._update_status, "Performing HPSS...") # Update status
+            y_percussive = librosa.effects.percussive(self.y)
+            # We could also get y_harmonic = librosa.effects.harmonic(self.y) if needed later
+            # ------------------ #
 
             # Get tempo
             try:
@@ -210,9 +217,10 @@ class DrumBeatExtractor:
                 self.tempo = 120 # Default if entry is invalid
                 self.root.after(0, self.tempo_var.set, "120") # Update UI
 
-            # Detect onsets
+            # Detect onsets (using the percussive component)
+            self.root.after(0, self._update_status, "Detecting onsets...") # Update status
             onset_env = librosa.onset.onset_strength(
-                y=self.y,
+                y=y_percussive, # Use percussive component here
                 sr=self.sr,
                 hop_length=512,
                 aggregate=np.median
@@ -249,12 +257,16 @@ class DrumBeatExtractor:
 
             onset_times = librosa.frames_to_time(self.onset_frames, sr=self.sr, hop_length=512)
 
-            # Enhanced drum classification
+            # Enhanced drum classification (using original audio segment for features)
+            self.root.after(0, self._update_status, "Classifying drum sounds...") # Update status
             self.drum_types = []
+            n_mfcc = 13 # Number of MFCCs to compute
+
             for i, frame in enumerate(self.onset_frames):
                 start_sample = frame * 512
                 # Use a slightly longer segment for better feature extraction
-                end_sample = min(len(self.y), start_sample + int(0.1 * self.sr)) # 100ms segment
+                segment_duration = 0.1 # 100ms segment
+                end_sample = min(len(self.y), start_sample + int(segment_duration * self.sr))
                 if start_sample >= end_sample:
                     continue
 
@@ -267,20 +279,49 @@ class DrumBeatExtractor:
                 spectral_bandwidth = librosa.feature.spectral_bandwidth(y=segment, sr=self.sr)[0].mean()
                 rms = np.sqrt(np.mean(segment**2))
                 zero_crossing_rate = librosa.feature.zero_crossing_rate(y=segment)[0].mean()
+                mfccs = librosa.feature.mfcc(y=segment, sr=self.sr, n_mfcc=n_mfcc)
+                mfcc1_mean = mfccs[0].mean()
+                # mfcc2_mean = mfccs[1].mean() # Could use more MFCCs if needed
 
-                # Refined rules for drum classification (still basic, adjust as needed)
-                if rms > 0.04 and spectral_centroid < 1500 and spectral_bandwidth < 2000:
+                # Refined rules with MFCCs (focus on kick)
+                # Adjust these thresholds based on testing!
+                kick_rms_thresh = 0.03
+                kick_spec_cent_thresh = 1200 # Lowered threshold
+                kick_spec_bw_thresh = 1800
+                # MFCC[0] often relates to overall energy/loudness balance across spectrum
+                # Kicks might have lower MFCC[0] than snares/hats? Experiment needed.
+                kick_mfcc1_thresh = -150 # Example threshold, needs tuning
+
+                snare_rms_thresh = 0.03
+                snare_spec_bw_thresh = 2500
+                snare_zcr_thresh = 0.08 # Slightly lower ZCR for snare vs hat
+
+                hat_spec_cent_thresh = 2500
+                hat_zcr_thresh = 0.15
+
+                # --- Classification Logic --- #
+                # Prioritize Kick detection if strong low-frequency energy detected
+                if (rms > kick_rms_thresh and
+                    spectral_centroid < kick_spec_cent_thresh and
+                    spectral_bandwidth < kick_spec_bw_thresh and
+                    mfcc1_mean > kick_mfcc1_thresh): # Added MFCC condition
                     drum_type = 36  # Kick (C1)
-                elif zero_crossing_rate > 0.15 and spectral_centroid > 2500:
+                # Then check for Hi-Hat (high ZCR and spectral centroid)
+                elif (zero_crossing_rate > hat_zcr_thresh and
+                      spectral_centroid > hat_spec_cent_thresh):
                     drum_type = 42  # Closed Hi-hat (F#1)
-                elif rms > 0.03 and spectral_bandwidth > 2500:
+                # Then check for Snare (mid-range energy, higher bandwidth)
+                elif (rms > snare_rms_thresh and
+                      spectral_bandwidth > snare_spec_bw_thresh and 
+                      zero_crossing_rate > snare_zcr_thresh):
                      drum_type = 38 # Snare (D1)
-                # Add more rules? Open Hi-hat (46), Crash (49), Ride (51), Toms (48, 47, 45, 43, 41)?
-                # Example for Open Hi-hat (might be tricky to distinguish from closed)
-                # elif zero_crossing_rate > 0.1 and spectral_centroid > 3000 and rms < 0.08:
-                #    drum_type = 46 # Open Hi-hat (A#1)
+                # Fallback / Default
                 else:
-                    drum_type = 38  # Default to Snare if unsure
+                    # Maybe default to kick if RMS is high but doesn't match others?
+                    if rms > kick_rms_thresh * 1.5: # If it's loud but not clearly hat/snare
+                         drum_type = 36 # Tentative Kick
+                    else:
+                         drum_type = 38 # Default to Snare if unsure
 
                 self.drum_types.append(drum_type)
 
